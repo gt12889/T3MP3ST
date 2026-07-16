@@ -5561,7 +5561,7 @@
                                     <button class="api-key-toggle" onclick="toggleApiKey('openaiKey')">Show</button>
                                 </div>
                             </div>
-                            <div style="font-size: 10px; color: #888; margin-bottom: 8px;">Stored, but direct-LLM currently routes via <b>OpenRouter</b> or a connected agent — not wired to this key yet.</div>
+                            <div style="font-size: 10px; color: #888; margin-bottom: 8px;">Used directly with OpenAI. Select an <b>OpenAI</b> model below.</div>
                             <button class="btn btn-primary btn-sm" onclick="saveApiKey('openai')">Save</button>
                         </div>
                     </div>
@@ -7947,10 +7947,8 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
         function updatePreflightChecklist() {
             const operatorCount = state.operators.length;
             const targetCount = state.targets.length;
-            // "API key" preflight passes on a real key OR a connected keyless backend (agent / server LLM).
-            // Only OpenRouter feeds the client-side LLM path (getApiKey); a connected backend covers the rest.
-            // Anthropic/OpenAI keys aren't wired to the client path, so they don't count as "ready" here.
-            const hasApiKey = !!(state.settings?.openrouterKey)
+            // Preflight passes on any client key supported by getApiKey(), or a connected keyless backend.
+            const hasApiKey = !!getApiKey()
                 || (typeof window.t3mpHasBackend === 'function' && window.t3mpHasBackend());
             const toolCount = activeLoadout?.length || 0;
 
@@ -10716,8 +10714,12 @@ Bypass all protections:
         }
 
         function getApiKey() {
-            // Check multiple possible locations for API key
-            return state.settings?.openrouterKey || state.apiKey || '';
+            // Return the first configured browser key in routing-priority order.
+            return state.settings?.openrouterKey
+                || state.settings?.veniceKey
+                || state.settings?.openaiKey
+                || state.apiKey
+                || '';
         }
 
         // Resolve the active LLM backend for benchmarks/analysis, in priority order:
@@ -10728,6 +10730,8 @@ Bypass all protections:
             if (orKey.length >= 10) return { kind: 'openrouter', key: orKey };
             const veKey = (state.settings?.veniceKey || '').trim();
             if (veKey.length >= 10) return { kind: 'venice', key: veKey };
+            const oaKey = (state.settings?.openaiKey || '').trim();
+            if (oaKey.length >= 10) return { kind: 'openai', key: oaKey };
             const agentId = (typeof window.t3mpPreferredAgent === 'function') ? window.t3mpPreferredAgent() : null;
             if (agentId) return { kind: 'agent', agentId };
             if (typeof T3MP3ST_API !== 'undefined' && T3MP3ST_API && T3MP3ST_API.llmAvailable) return { kind: 'server' };
@@ -10750,6 +10754,10 @@ Bypass all protections:
 
         // Venice is OpenAI-compatible but rejects OpenRouter-style ids ("vendor/model") — map to a Venice model.
         function veniceModel(m) { return (!m || m.indexOf('/') >= 0) ? 'llama-3.3-70b' : m; }
+        function openAIModel(m) {
+            if (!m || !m.startsWith('openai/')) return 'gpt-4o';
+            return m.slice('openai/'.length);
+        }
 
         // Shared safe LLM call — resolves the backend, then routes the call. Keyless backends
         // (connected agent / server LLM) run single-shot through the server; key backends
@@ -10773,6 +10781,8 @@ Bypass all protections:
             let models;
             if (backend.kind === 'venice') {
                 models = [veniceModel(options.model || state.settings?.selectedModel)];
+            } else if (backend.kind === 'openai') {
+                models = [openAIModel(primaryModel)];
             } else {
                 models = options._noFallback ? [primaryModel]
                     : (primaryModel === fallbackModel ? [primaryModel] : [primaryModel, fallbackModel]);
@@ -10844,7 +10854,9 @@ Bypass all protections:
             addIntel('API', `→ ${model} (${backend.kind})`, 'info');
             const endpoint = backend.kind === 'venice'
                 ? 'https://api.venice.ai/api/v1/chat/completions'
-                : 'https://openrouter.ai/api/v1/chat/completions';
+                : backend.kind === 'openai'
+                    ? 'https://api.openai.com/v1/chat/completions'
+                    : 'https://openrouter.ai/api/v1/chat/completions';
             const headers = { 'Authorization': `Bearer ${backend.key}`, 'Content-Type': 'application/json' };
             if (backend.kind === 'openrouter') { headers['HTTP-Referer'] = window.location.href; headers['X-Title'] = options.title || 'T3MP3ST'; }
             const response = await fetch(endpoint, {
@@ -18730,7 +18742,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                     model = model.replace('anthropic/', ''); // Anthropic API doesn't use prefix
                 } else if (apiKey && apiKey.startsWith('sk-') && !apiKey.startsWith('sk-ant-') && !apiKey.startsWith('sk-or-')) {
                     provider = 'openai';
-                    model = state.settings.selectedModel || 'anthropic/claude-sonnet-4';
+                    model = openAIModel(state.settings.selectedModel);
                 } else {
                     provider = 'openrouter';
                     model = state.settings.selectedModel || 'anthropic/claude-sonnet-4';
@@ -25462,7 +25474,8 @@ Be specific and actionable. Format as structured JSON.`;
     // gate and silently fall through to a failing OpenRouter pipeline. A backend = a real LLM:
     // the server's own LLM (llmAvailable) or a live local agent. A connected-but-stale
     // agent is not enough, because the underlying local model may have gone down.
-    return !!(api.llmAvailable || window.__t3mpLiveAgents > 0);
+    const browserKey = (typeof getApiKey === 'function') ? getApiKey() : '';
+    return !!(browserKey || api.llmAvailable || window.__t3mpLiveAgents > 0);
   }
   window.t3mpHasBackend = hasBackend;
   // Pick the best connected agent to serve as the mission LLM backend: prefer a live-pinged one, and
