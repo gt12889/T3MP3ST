@@ -526,6 +526,27 @@ class AnthropicAdapter implements LLMProviderAdapter {
 // OPENAI ADAPTER
 // =============================================================================
 
+const OPENAI_MAX_CONCURRENCY = 2;
+const OPENAI_MIN_INTERVAL_MS = 7000;
+let openAIActiveRequests = 0;
+let openAINextStartAt = 0;
+const openAIWaiters: Array<() => void> = [];
+
+async function acquireOpenAIRateSlot(): Promise<() => void> {
+  if (openAIActiveRequests >= OPENAI_MAX_CONCURRENCY) {
+    await new Promise<void>(resolve => openAIWaiters.push(resolve));
+  }
+  openAIActiveRequests++;
+  const now = Date.now();
+  const startAt = Math.max(now, openAINextStartAt);
+  openAINextStartAt = startAt + OPENAI_MIN_INTERVAL_MS;
+  if (startAt > now) await new Promise(resolve => setTimeout(resolve, startAt - now));
+  return () => {
+    openAIActiveRequests = Math.max(0, openAIActiveRequests - 1);
+    openAIWaiters.shift()?.();
+  };
+}
+
 class OpenAIAdapter implements LLMProviderAdapter {
   name = 'openai';
   private config: LLMConfig;
@@ -575,11 +596,16 @@ class OpenAIAdapter implements LLMProviderAdapter {
     const requestBody: Record<string, unknown> = {
       model: this.config.model,
       messages: this.formatMessages(messages),
-      max_tokens: options?.maxTokens || this.config.maxTokens || 4096,
-      temperature: options?.temperature ?? this.config.temperature ?? 0.7,
       top_p: options?.topP,
       stop: options?.stopSequences,
     };
+    const maxTokens = options?.maxTokens || this.config.maxTokens || 2000;
+    if (this.config.provider === 'openai' && /^(gpt-5|o[1-9])/.test(this.config.model)) {
+      requestBody.max_completion_tokens = maxTokens;
+    } else {
+      requestBody.max_tokens = maxTokens;
+      requestBody.temperature = options?.temperature ?? this.config.temperature ?? 0.7;
+    }
 
     if (options?.tools?.length) {
       requestBody.tools = options.tools.map(t => ({
@@ -588,19 +614,27 @@ class OpenAIAdapter implements LLMProviderAdapter {
       }));
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.config.apiKey}`,
-      },
-      body: JSON.stringify(requestBody),
-      signal: AbortSignal.timeout(this.config.timeout || 60000),
-    });
+    const release = this.config.provider === 'openai' ? await acquireOpenAIRateSlot() : () => {};
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(this.config.timeout || 60000),
+      });
+    } finally {
+      release();
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${errorText}`);
+      const retryAfterHeader = response.headers.get('retry-after');
+      const retryAfterMs = retryAfterHeader ? (parseInt(retryAfterHeader, 10) || 1) * 1000 : undefined;
+      throw new LLMApiError(`OpenAI API error: ${response.status} - ${errorText}`, response.status, retryAfterMs);
     }
 
     const data = await response.json() as OpenRouterResponse;
@@ -1216,8 +1250,14 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
     super();
     this.config = config;
     this.adapter = this.createAdapter(config);
+    if (config.provider === 'openai' && (!config.fallbackChain || config.fallbackChain.length === 0)) {
+      this.config.fallbackChain = [{ provider: 'openai', model: 'gpt-5.4-mini', apiKey: config.apiKey, baseUrl: config.baseUrl }];
+    }
     if (config.provider === 'codex') {
       this.retryAttempts = 1;
+    } else if (config.provider === 'openai') {
+      this.retryAttempts = 4;
+      this.retryDelayMs = 10000;
     }
   }
 
