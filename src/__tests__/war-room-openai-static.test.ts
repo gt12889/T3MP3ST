@@ -35,4 +35,16 @@ describe('War Room OpenAI key routing', () => {
     expect(fn).toContain("typeof getApiKey === 'function'");
     expect(fn).toContain('browserKey || api.llmAvailable');
   });
+
+  it('loads project-available models from the OpenAI Models API', () => {
+    const fn = block('async function refreshOpenAIModels()', '\n        }');
+    expect(fn).toContain('https://api.openai.com/v1/models');
+    expect(fn).toContain('isOpenAIChatModel');
+    expect(fn).toContain('state.settings.openaiModels = ids');
+  });
+
+  it('uses modern token parameters for GPT-5 and reasoning models', () => {
+    const fn = block('async function _safeLLMCallOnce(', '\n        }');
+    expect(fn).toContain('max_completion_tokens');
+  });
 });
