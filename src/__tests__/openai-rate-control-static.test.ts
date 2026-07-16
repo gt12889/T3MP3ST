@@ -9,7 +9,7 @@ describe('OpenAI rate controls', () => {
   it('paces OpenAI calls for the current project limits', () => {
     expect(llm).toContain('OPENAI_MAX_CONCURRENCY = 2');
     expect(llm).toContain('OPENAI_MIN_INTERVAL_MS = 7000');
-    expect(llm).toContain('acquireOpenAIRateSlot');
+    expect(llm).toContain('acquireOpenAIRateSlot(this.config.model)');
   });
 
   it('retries 429s with Retry-After and a four-attempt backoff policy', () => {
@@ -18,9 +18,11 @@ describe('OpenAI rate controls', () => {
     expect(llm).toContain('this.retryDelayMs = 10000');
   });
 
-  it('defaults OpenAI to Luna with the mini fallback and 2000 tokens', () => {
+  it('deploys requests across independent OpenAI model tiers', () => {
     expect(config).toContain("defaultModel: 'gpt-5.6-luna'");
     expect(config).toContain('maxTokens: 2000');
-    expect(llm).toContain("model: 'gpt-5.4-mini'");
+    expect(llm).toContain("['gpt-5.6-luna', 'gpt-5.4-mini', 'gpt-5-mini', 'gpt-5-nano']");
+    expect(llm).toContain('openAIDeploymentCursor++');
+    expect(llm).toContain('error.status === 429 && hasNext');
   });
 });

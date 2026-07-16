@@ -528,22 +528,25 @@ class AnthropicAdapter implements LLMProviderAdapter {
 
 const OPENAI_MAX_CONCURRENCY = 2;
 const OPENAI_MIN_INTERVAL_MS = 7000;
-let openAIActiveRequests = 0;
-let openAINextStartAt = 0;
-const openAIWaiters: Array<() => void> = [];
+const OPENAI_DEPLOYMENT_MODELS = ['gpt-5.6-luna', 'gpt-5.4-mini', 'gpt-5-mini', 'gpt-5-nano'] as const;
+interface OpenAIRateState { active: number; nextStartAt: number; waiters: Array<() => void> }
+const openAIRateStates = new Map<string, OpenAIRateState>();
+let openAIDeploymentCursor = 0;
 
-async function acquireOpenAIRateSlot(): Promise<() => void> {
-  if (openAIActiveRequests >= OPENAI_MAX_CONCURRENCY) {
-    await new Promise<void>(resolve => openAIWaiters.push(resolve));
+async function acquireOpenAIRateSlot(model: string): Promise<() => void> {
+  const state = openAIRateStates.get(model) || { active: 0, nextStartAt: 0, waiters: [] };
+  openAIRateStates.set(model, state);
+  if (state.active >= OPENAI_MAX_CONCURRENCY) {
+    await new Promise<void>(resolve => state.waiters.push(resolve));
   }
-  openAIActiveRequests++;
+  state.active++;
   const now = Date.now();
-  const startAt = Math.max(now, openAINextStartAt);
-  openAINextStartAt = startAt + OPENAI_MIN_INTERVAL_MS;
+  const startAt = Math.max(now, state.nextStartAt);
+  state.nextStartAt = startAt + OPENAI_MIN_INTERVAL_MS;
   if (startAt > now) await new Promise(resolve => setTimeout(resolve, startAt - now));
   return () => {
-    openAIActiveRequests = Math.max(0, openAIActiveRequests - 1);
-    openAIWaiters.shift()?.();
+    state.active = Math.max(0, state.active - 1);
+    state.waiters.shift()?.();
   };
 }
 
@@ -614,7 +617,7 @@ class OpenAIAdapter implements LLMProviderAdapter {
       }));
     }
 
-    const release = this.config.provider === 'openai' ? await acquireOpenAIRateSlot() : () => {};
+    const release = this.config.provider === 'openai' ? await acquireOpenAIRateSlot(this.config.model) : () => {};
     let response: Response;
     try {
       response = await fetch(url, {
@@ -1250,9 +1253,6 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
     super();
     this.config = config;
     this.adapter = this.createAdapter(config);
-    if (config.provider === 'openai' && (!config.fallbackChain || config.fallbackChain.length === 0)) {
-      this.config.fallbackChain = [{ provider: 'openai', model: 'gpt-5.4-mini', apiKey: config.apiKey, baseUrl: config.baseUrl }];
-    }
     if (config.provider === 'codex') {
       this.retryAttempts = 1;
     } else if (config.provider === 'openai') {
@@ -1325,10 +1325,19 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
     // tried when the rung above fails for ANY reason that model can't fix itself —
     // hard errors that survive same-model retries (rate-limit, 5xx, timeout, auth,
     // 404, context-length) OR soft failures on a 200 (a refusal, or empty output).
-    const ladder: FallbackEntry[] = [
-      { provider: this.config.provider, model: this.config.model, apiKey: this.config.apiKey, baseUrl: this.config.baseUrl },
-      ...(this.config.fallbackChain || []),
-    ];
+    let ladder: FallbackEntry[];
+    if (this.config.provider === 'openai') {
+      const offset = openAIDeploymentCursor++ % OPENAI_DEPLOYMENT_MODELS.length;
+      const rotated = [...OPENAI_DEPLOYMENT_MODELS.slice(offset), ...OPENAI_DEPLOYMENT_MODELS.slice(0, offset)];
+      ladder = rotated.map(model => ({
+        provider: 'openai' as const, model, apiKey: this.config.apiKey, baseUrl: this.config.baseUrl,
+      }));
+    } else {
+      ladder = [
+        { provider: this.config.provider, model: this.config.model, apiKey: this.config.apiKey, baseUrl: this.config.baseUrl },
+        ...(this.config.fallbackChain || []),
+      ];
+    }
 
     let lastError: Error | null = null;
     let reframeNext = false; // honest authz restatement on the hop after a refusal
@@ -1338,7 +1347,9 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
       const hop = ladder[rung];
       const onFallback = rung > 0;
       const hasNext = rung < ladder.length - 1;
-      const adapter = onFallback ? this.createAdapter({ ...this.config, ...hop }) : this.adapter;
+      const adapter = (onFallback || this.config.provider === 'openai')
+        ? this.createAdapter({ ...this.config, ...hop })
+        : this.adapter;
       const msgs = reframeNext ? reframeWithAuthorizedContext(messages) : messages;
 
       // ── same-model retry loop: only transient hard errors retry in place ──
@@ -1352,6 +1363,8 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
           // auth / forbidden / missing-model won't fix on retry — bail to next hop
           const permanent = error instanceof LLMApiError &&
             (error.status === 401 || error.status === 403 || error.status === 404);
+          const switchTier = error instanceof LLMApiError && error.status === 429 && hasNext;
+          if (switchTier) break;
           if (permanent || attempt >= this.retryAttempts) break;
           let delayMs = this.retryDelayMs * Math.pow(2, attempt - 1);
           if (error instanceof LLMApiError && error.retryAfterMs) {
