@@ -5561,7 +5561,7 @@
                                     <button class="api-key-toggle" onclick="toggleApiKey('openaiKey')">Show</button>
                                 </div>
                             </div>
-                            <div style="font-size: 10px; color: #888; margin-bottom: 8px;">Stored, but direct-LLM currently routes via <b>OpenRouter</b> or a connected agent — not wired to this key yet.</div>
+                            <div style="font-size: 10px; color: #888; margin-bottom: 8px;">Used directly with OpenAI. Select an <b>OpenAI</b> model below.</div>
                             <button class="btn btn-primary btn-sm" onclick="saveApiKey('openai')">Save</button>
                         </div>
                     </div>
@@ -5591,6 +5591,10 @@
                     <div class="settings-section">
                         <h2 class="settings-title">🤖 Model Selection</h2>
                         <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 12px;">Select your preferred AI model for agent operations</p>
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+                            <button class="btn btn-primary btn-sm" onclick="refreshOpenAIModels()">↻ Refresh OpenAI models</button>
+                            <span id="openaiModelsStatus" style="font-size:11px;color:#888;">Uses models available to your API project</span>
+                        </div>
                         <div class="model-selector" id="modelSelector">
                             <div style="color: var(--text-muted); padding: 20px; text-align: center;">Loading models...</div>
                         </div>
@@ -5853,7 +5857,7 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
             findings: [],
             credentials: [],
             activities: [],
-            settings: { openrouterKey: '', anthropicKey: '', openaiKey: '', selectedModel: 'anthropic/claude-opus-4.6', fallbackModel: 'nousresearch/hermes-3-llama-3.1-405b' },
+            settings: { openrouterKey: '', anthropicKey: '', openaiKey: '', selectedModel: 'openai/gpt-5.6-luna', fallbackModel: 'openai/gpt-5.4-mini' },
             connected: false
         };
 
@@ -6979,9 +6983,13 @@ Correlating findings across agents, identifying patterns, producing actionable i
             { id: 'anthropic/claude-sonnet-4.5', name: 'Claude Sonnet 4.5', provider: 'Anthropic' },
             { id: 'anthropic/claude-haiku-4.5', name: 'Claude Haiku 4.5', provider: 'Anthropic' },
             { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', provider: 'Anthropic' },
-            // OpenAI
-            { id: 'openai/gpt-4o', name: 'GPT-4o', provider: 'OpenAI' },
-            { id: 'openai/o1', name: 'o1', provider: 'OpenAI' },
+            // OpenAI fallback catalog; Settings can refresh this from GET /v1/models.
+            { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', provider: 'OpenAI' },
+            { id: 'openai/gpt-5.6-terra', name: 'GPT-5.6 Terra', provider: 'OpenAI' },
+            { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', provider: 'OpenAI' },
+            { id: 'openai/gpt-5.5', name: 'GPT-5.5', provider: 'OpenAI' },
+            { id: 'openai/gpt-5.4', name: 'GPT-5.4', provider: 'OpenAI' },
+            { id: 'openai/gpt-5.4-mini', name: 'GPT-5.4 mini', provider: 'OpenAI' },
             // Google (Dec 2025)
             { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', provider: 'Google' },
             { id: 'google/gemini-3-flash-preview', name: 'Gemini 3 Flash', provider: 'Google' },
@@ -7054,6 +7062,10 @@ Correlating findings across agents, identifying patterns, producing actionable i
                 try {
                     const p = JSON.parse(saved);
                     Object.assign(state.settings, p.settings || {});
+                    if (state.settings.openaiKey && ['openai/gpt-4o', 'openai/o1'].includes(state.settings.selectedModel)) {
+                        state.settings.selectedModel = 'openai/gpt-5.6-luna';
+                        state.settings.fallbackModel = 'openai/gpt-5.4-mini';
+                    }
                     state.targets = p.targets || [];
                     state.findings = p.findings || [];
                     state.credentials = p.credentials || [];
@@ -7947,10 +7959,8 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
         function updatePreflightChecklist() {
             const operatorCount = state.operators.length;
             const targetCount = state.targets.length;
-            // "API key" preflight passes on a real key OR a connected keyless backend (agent / server LLM).
-            // Only OpenRouter feeds the client-side LLM path (getApiKey); a connected backend covers the rest.
-            // Anthropic/OpenAI keys aren't wired to the client path, so they don't count as "ready" here.
-            const hasApiKey = !!(state.settings?.openrouterKey)
+            // Preflight passes on any client key supported by getApiKey(), or a connected keyless backend.
+            const hasApiKey = !!getApiKey()
                 || (typeof window.t3mpHasBackend === 'function' && window.t3mpHasBackend());
             const toolCount = activeLoadout?.length || 0;
 
@@ -8778,6 +8788,15 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
             if (!container) {
                 console.error('modelSelector element not found');
                 return;
+            }
+            const savedOpenAIModels = state.settings?.openaiModels;
+            if (Array.isArray(savedOpenAIModels) && savedOpenAIModels.length) {
+                for (let i = MODELS.length - 1; i >= 0; i--) {
+                    if (MODELS[i].provider === 'OpenAI') MODELS.splice(i, 1);
+                }
+                const insertAt = MODELS.findIndex(m => m.provider !== 'Anthropic');
+                MODELS.splice(insertAt < 0 ? MODELS.length : insertAt, 0,
+                    ...savedOpenAIModels.map(id => ({ id: `openai/${id}`, name: id, provider: 'OpenAI' })));
             }
             if (!MODELS || MODELS.length === 0) {
                 container.innerHTML = '<div style="color: var(--error);">No models available</div>';
@@ -10716,8 +10735,51 @@ Bypass all protections:
         }
 
         function getApiKey() {
-            // Check multiple possible locations for API key
-            return state.settings?.openrouterKey || state.apiKey || '';
+            // Return the first configured browser key in routing-priority order.
+            return state.settings?.openrouterKey
+                || state.settings?.veniceKey
+                || state.settings?.openaiKey
+                || state.apiKey
+                || '';
+        }
+
+        function isOpenAIChatModel(id) {
+            if (!id || !/^(gpt-|o[1-9])/.test(id)) return false;
+            return !/(audio|realtime|transcrib|tts|search|image|vision-preview|instruct)/i.test(id);
+        }
+
+        async function refreshOpenAIModels() {
+            const status = document.getElementById('openaiModelsStatus');
+            const key = (state.settings?.openaiKey || '').trim();
+            if (!key) { toast('Save an OpenAI API key first', 'error'); return; }
+            if (status) status.textContent = 'Loading models available to this project…';
+            try {
+                const response = await fetch('https://api.openai.com/v1/models', {
+                    headers: { 'Authorization': `Bearer ${key}` },
+                    signal: AbortSignal.timeout(20000)
+                });
+                if (!response.ok) {
+                    const detail = await response.text().catch(() => '');
+                    throw new Error(`OpenAI ${response.status}: ${detail.substring(0, 160)}`);
+                }
+                const payload = await response.json();
+                const ids = (payload.data || []).map(m => m.id).filter(isOpenAIChatModel).sort();
+                if (!ids.length) throw new Error('No compatible text-generation models were returned');
+                for (let i = MODELS.length - 1; i >= 0; i--) {
+                    if (MODELS[i].provider === 'OpenAI') MODELS.splice(i, 1);
+                }
+                const insertAt = MODELS.findIndex(m => m.provider !== 'Anthropic');
+                MODELS.splice(insertAt < 0 ? MODELS.length : insertAt, 0,
+                    ...ids.map(id => ({ id: `openai/${id}`, name: id, provider: 'OpenAI' })));
+                state.settings.openaiModels = ids;
+                saveState();
+                renderModels();
+                if (status) status.textContent = `${ids.length} OpenAI models available`;
+                toast(`Loaded ${ids.length} OpenAI models`, 'success');
+            } catch (error) {
+                if (status) status.textContent = error.message;
+                toast(`Could not load OpenAI models: ${error.message}`, 'error');
+            }
         }
 
         // Resolve the active LLM backend for benchmarks/analysis, in priority order:
@@ -10728,6 +10790,8 @@ Bypass all protections:
             if (orKey.length >= 10) return { kind: 'openrouter', key: orKey };
             const veKey = (state.settings?.veniceKey || '').trim();
             if (veKey.length >= 10) return { kind: 'venice', key: veKey };
+            const oaKey = (state.settings?.openaiKey || '').trim();
+            if (oaKey.length >= 10) return { kind: 'openai', key: oaKey };
             const agentId = (typeof window.t3mpPreferredAgent === 'function') ? window.t3mpPreferredAgent() : null;
             if (agentId) return { kind: 'agent', agentId };
             if (typeof T3MP3ST_API !== 'undefined' && T3MP3ST_API && T3MP3ST_API.llmAvailable) return { kind: 'server' };
@@ -10750,6 +10814,10 @@ Bypass all protections:
 
         // Venice is OpenAI-compatible but rejects OpenRouter-style ids ("vendor/model") — map to a Venice model.
         function veniceModel(m) { return (!m || m.indexOf('/') >= 0) ? 'llama-3.3-70b' : m; }
+        function openAIModel(m) {
+            if (!m || !m.startsWith('openai/')) return 'gpt-5.6-sol';
+            return m.slice('openai/'.length);
+        }
 
         // Shared safe LLM call — resolves the backend, then routes the call. Keyless backends
         // (connected agent / server LLM) run single-shot through the server; key backends
@@ -10769,10 +10837,12 @@ Bypass all protections:
             }
 
             const primaryModel = options.model || state.settings?.selectedModel || 'anthropic/claude-opus-4.6';
-            const fallbackModel = state.settings?.fallbackModel || 'nousresearch/hermes-3-llama-3.1-405b';
+            const fallbackModel = state.settings?.fallbackModel || 'openai/gpt-5.4-mini';
             let models;
             if (backend.kind === 'venice') {
                 models = [veniceModel(options.model || state.settings?.selectedModel)];
+            } else if (backend.kind === 'openai') {
+                models = [openAIModel(primaryModel)];
             } else {
                 models = options._noFallback ? [primaryModel]
                     : (primaryModel === fallbackModel ? [primaryModel] : [primaryModel, fallbackModel]);
@@ -10844,7 +10914,9 @@ Bypass all protections:
             addIntel('API', `→ ${model} (${backend.kind})`, 'info');
             const endpoint = backend.kind === 'venice'
                 ? 'https://api.venice.ai/api/v1/chat/completions'
-                : 'https://openrouter.ai/api/v1/chat/completions';
+                : backend.kind === 'openai'
+                    ? 'https://api.openai.com/v1/chat/completions'
+                    : 'https://openrouter.ai/api/v1/chat/completions';
             const headers = { 'Authorization': `Bearer ${backend.key}`, 'Content-Type': 'application/json' };
             if (backend.kind === 'openrouter') { headers['HTTP-Referer'] = window.location.href; headers['X-Title'] = options.title || 'T3MP3ST'; }
             const response = await fetch(endpoint, {
@@ -10855,8 +10927,9 @@ Bypass all protections:
                     messages: Array.isArray(prompt)
                         ? prompt
                         : [{ role: 'user', content: prompt }],
-                    max_tokens: options.maxTokens || 4096,
-                    temperature: options.temperature ?? 0.3
+                    ...(backend.kind === 'openai' && /^(gpt-5|o[1-9])/.test(model)
+                        ? { max_completion_tokens: options.maxTokens || 2000 }
+                        : { max_tokens: options.maxTokens || 4096, temperature: options.temperature ?? 0.3 })
                 }),
                 signal: AbortSignal.timeout(options.timeout || 120000)
             });
@@ -18730,7 +18803,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                     model = model.replace('anthropic/', ''); // Anthropic API doesn't use prefix
                 } else if (apiKey && apiKey.startsWith('sk-') && !apiKey.startsWith('sk-ant-') && !apiKey.startsWith('sk-or-')) {
                     provider = 'openai';
-                    model = state.settings.selectedModel || 'anthropic/claude-sonnet-4';
+                    model = openAIModel(state.settings.selectedModel);
                 } else {
                     provider = 'openrouter';
                     model = state.settings.selectedModel || 'anthropic/claude-sonnet-4';
@@ -25462,7 +25535,8 @@ Be specific and actionable. Format as structured JSON.`;
     // gate and silently fall through to a failing OpenRouter pipeline. A backend = a real LLM:
     // the server's own LLM (llmAvailable) or a live local agent. A connected-but-stale
     // agent is not enough, because the underlying local model may have gone down.
-    return !!(api.llmAvailable || window.__t3mpLiveAgents > 0);
+    const browserKey = (typeof getApiKey === 'function') ? getApiKey() : '';
+    return !!(browserKey || api.llmAvailable || window.__t3mpLiveAgents > 0);
   }
   window.t3mpHasBackend = hasBackend;
   // Pick the best connected agent to serve as the mission LLM backend: prefer a live-pinged one, and
